@@ -154,9 +154,18 @@ class VllmBackend(SllmBackend):
         self.request_trace = LLMEngineStatusDict()
         # if trace_debug is True, request trace will not be deleted after completion
         self.trace_debug = backend_config.get("trace_debug", False)
-        self.enforce_eager = backend_config.get("enforce_eager", False)
-        self.enable_prefix_caching = backend_config.get(
-            "enable_prefix_caching", True
+
+        # Robustly parse booleans from config (accepts True/False or "true"/"false")
+        def _to_bool(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() in {"true", "1", "yes", "y", "t"}
+            return bool(value)
+
+        self.enforce_eager = _to_bool(backend_config.get("enforce_eager", False))
+        self.enable_prefix_caching = _to_bool(
+            backend_config.get("enable_prefix_caching", True)
         )
         self.task = backend_config.get("task", "auto")
 

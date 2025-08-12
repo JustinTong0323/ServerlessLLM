@@ -143,6 +143,7 @@ class SllmController:
             namespace="models",
             num_cpus=1,
             resources={"control_node": 0.1},
+            max_concurrency=1024,
         ).remote(
             model_name,
             resource_requirements,

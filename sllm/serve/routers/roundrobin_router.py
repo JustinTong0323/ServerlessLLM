@@ -71,7 +71,8 @@ class RoundRobinRouter(SllmRouter):
         self.backend_config = backend_config
         self.router_config = router_config
 
-        self.loop_interval = 1
+        # Allow configuring the loop interval to reduce dispatcher pacing.
+        self.loop_interval = router_config.get("loop_interval", 1)
         self.loop = asyncio.get_running_loop()
         self.request_queue = asyncio.Queue()  # type:ignore
         self.starting_instances: Dict[str, InstanceHandle] = {}  # type:ignore
@@ -256,40 +257,61 @@ class RoundRobinRouter(SllmRouter):
         return deleted_instance_id
 
     async def _load_balancer_loop(self):
-        # this is a simple round-robin load balancer
+        # Round-robin load balancer with batched, asynchronous allocation
         round_robin_index = 0
+        pending_allocations = []  # list[asyncio.Future]
         while True:
-            instance_allocation = await self.request_queue.get()
-            allocated = False
-            logger.info(f"A request is waiting for model {self.model_name}")
-            while not allocated:
-                # 1. get ready instances
-                instance_options = None
-                while not instance_options:
-                    await asyncio.sleep(1)
-                    async with self.instance_management_lock:
-                        instance_options = list(self.ready_instances.keys())
-                    logger.info(f"{instance_options}")
-                logger.info(f"Got ready instances {instance_options}")
-                instance_id = instance_options[
-                    round_robin_index % len(instance_options)
-                ]
-                round_robin_index += 1
+            # Drain any queued requests without blocking
+            try:
+                while True:
+                    fut = self.request_queue.get_nowait()
+                    pending_allocations.append(fut)
+            except asyncio.QueueEmpty:
+                pass
+
+            if not pending_allocations:
+                await asyncio.sleep(self.loop_interval)
+                continue
+
+            # Snapshot current ready instances
+            async with self.instance_management_lock:
+                instance_options = list(self.ready_instances.keys())
+
+            if not instance_options:
+                await asyncio.sleep(self.loop_interval)
+                continue
+
+            made_progress = False
+
+            # Try to allocate as many pending requests as possible this tick
+            num_instances = len(instance_options)
+            start_idx = round_robin_index % max(1, num_instances)
+            for offset in range(num_instances):
+                if not pending_allocations:
+                    break
+                instance_id = instance_options[(start_idx + offset) % num_instances]
+
+                # Fetch instance handle (may disappear between snapshots)
                 async with self.instance_management_lock:
-                    if instance_id not in self.ready_instances:
-                        continue
-                    instance = self.ready_instances[instance_id]
-                    # check if the request queue reaches max length
-                    if await instance.check_request_queue():
-                        allocated = await instance.add_requests(1)
-                        if allocated:
-                            instance_allocation.set_result(instance_id)
-                    else:
-                        logger.info(
-                            f"Instance {instance_id} cannot add another request"
-                        )
-                if not allocated:
-                    await asyncio.sleep(self.loop_interval)
+                    instance = self.ready_instances.get(instance_id)
+                if instance is None:
+                    continue
+
+                # While this instance has capacity, allocate one request at a time
+                while pending_allocations and await instance.check_request_queue():
+                    ok = await instance.add_requests(1)
+                    if not ok:
+                        break
+                    fut = pending_allocations.pop(0)
+                    fut.set_result(instance_id)
+                    made_progress = True
+
+            # Advance round-robin index
+            round_robin_index += 1
+
+            if not made_progress:
+                # No capacity anywhere; back off briefly
+                await asyncio.sleep(self.loop_interval)
 
     async def _auto_scaler_loop(self):
         while True:

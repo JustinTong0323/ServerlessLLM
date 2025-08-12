@@ -45,10 +45,15 @@ def start_instance(
         raise ValueError(f"Unknown backend: {backend}")
 
     model_actor_cls = ray.remote(model_backend_cls)
+    # Ensure max_concurrency is an int; allow overriding via backend_config
+    try:
+        max_concurrency = int(backend_config.get("max_concurrency", 1024))
+    except Exception:
+        max_concurrency = 1024
 
     return model_actor_cls.options(
         name=instance_id,
         **startup_config,
-        max_concurrency=10,
+        max_concurrency=max_concurrency,
         lifetime="detached",
     ).remote(model_name, backend_config)
