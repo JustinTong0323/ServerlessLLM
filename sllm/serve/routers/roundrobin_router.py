@@ -195,7 +195,6 @@ class RoundRobinRouter(SllmRouter):
                         "queue": stream_info["queue"],
                         "request_id": stream_info["request_id"],
                         "instance_id": instance_id,  # For cleanup reference
-                        "router_cleanup_needed": True
                     }
                 else:
                     # Non-streaming response

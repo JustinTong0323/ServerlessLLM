@@ -172,17 +172,19 @@ def create_app() -> FastAPI:
                     
                     # Get the queue directly from the response
                     stream_queue = stream_info["queue"]
+                    timeout = 600.0 # set to 10 minutes
                     
-                    # Read from queue directly - this is the real streaming!
+                    # Stream processing loop
                     while True:
                         try:
+                            # sleep to avoid busy-waiting
+                            await asyncio.sleep(0.0001)
                             # Get chunk from queue with timeout
-                            chunk = await asyncio.wait_for(stream_queue.get_async(), timeout=30.0)
+                            chunk = await asyncio.wait_for(stream_queue.get_async(), timeout=timeout)
                             
                             # None signals end of stream
                             if chunk is None:
-                                # Stream completed, trigger cleanup
-                                if stream_info.get("router_cleanup_needed") and "instance_id" in stream_info:
+                                if "instance_id" in stream_info:
                                     try:
                                         await request_router.cleanup_streaming_request.remote(stream_info["instance_id"])
                                     except Exception as cleanup_error:
@@ -194,7 +196,7 @@ def create_app() -> FastAPI:
                         except asyncio.TimeoutError:
                             yield "data: " + orjson.dumps({"error": {"message": "Stream timeout"}}).decode("utf-8") + "\n\n"
                             # Also cleanup on timeout
-                            if stream_info.get("router_cleanup_needed") and "instance_id" in stream_info:
+                            if "instance_id" in stream_info:
                                 try:
                                     await request_router.cleanup_streaming_request.remote(stream_info["instance_id"])
                                 except Exception as cleanup_error:
@@ -205,10 +207,13 @@ def create_app() -> FastAPI:
                     out = {"error": {"message": str(e)}}
                     yield "data: " + orjson.dumps(out).decode("utf-8") + "\n\n"
                 finally:
-                    # Clean up resources - Note: cleanup is handled by backend's _stream_to_queue finally block
-                    # and router will handle request counting when the stream completes
+                    # Clean up resources
                     if stream_info and "request_id" in stream_info:
                         logger.info(f"Streaming completed for request {stream_info['request_id']}")
+                        try:
+                            await request_router.cleanup_streaming_request.remote(stream_info["instance_id"])
+                        except Exception as cleanup_error:
+                            logger.error(f"Error during router cleanup: {cleanup_error}")
                 
                 yield "data: [DONE]\n\n"
 

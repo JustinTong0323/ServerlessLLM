@@ -17,7 +17,6 @@
 # ---------------------------------------------------------------------------- #
 import asyncio
 import gc
-import inspect
 import logging
 import os
 import time
@@ -261,16 +260,14 @@ class VllmBackend(SllmBackend):
             inputs, sampling_params, request_id
         )
 
-        # For streaming, create a queue and start the streaming task
+        # Streaming: Use preheated queue
         if stream:
-            # Create a queue for streaming
-            stream_queue = Queue(maxsize=1000)
+            stream_queue = Queue(maxsize=50)
             
-            # Start streaming task in background
-            # Note: We don't await this task - it runs independently
-            asyncio.create_task(self._stream_to_queue(
+            # Wait for first token before returning
+            await self._get_first_chunk_and_start_streaming(
                 stream_queue, results_generator, request_id, model_name
-            ))
+            )
             
             return {
                 "streaming": True,
@@ -282,34 +279,112 @@ class VllmBackend(SllmBackend):
         final_output = None
         async for response_output in results_generator:
             final_output = response_output
-            if self.trace_debug:
-                asyncio.create_task(
-                    self.request_trace.update_status(request_id, response_output)
-                )
+            asyncio.create_task(
+                self.request_trace.update_status(request_id, response_output)
+            )
 
         assert final_output is not None
 
         if not self.trace_debug:
-            asyncio.create_task(
-                self.request_trace.delete_request(request_id)
-            )
+            await self.request_trace.delete_request(request_id)
 
         return process_output(final_output, model_name)
 
-    async def _stream_to_queue(self, stream_queue, results_generator, request_id: str, model_name: str):
+    async def _get_first_chunk_and_start_streaming(self, stream_queue, results_generator, request_id: str, model_name: str):
         """
-        Stream generation results directly to a queue.
-        This runs in the background and feeds the queue.
+        Wait for first token and start background streaming.
+        Optimizes TTFT by ensuring first token is ready before returning.
         """
         previous_text_lengths: Dict[int, int] = {}
         
         try:
+            # Wait for first response from vLLM engine
+            first_response = await anext(results_generator)
+            
+            await self.request_trace.update_status(request_id, first_response)
+            
+            created_ts = (
+                int(time.time())
+                if first_response.metrics is None
+                else first_response.metrics.arrival_time
+            )
+
+            # Create and queue the first chunk(s)
+            for idx, result in enumerate(first_response.outputs):
+                full_text = result.text or ""
+                prev_len = previous_text_lengths.get(idx, 0)
+                delta_text = full_text[prev_len:]
+                previous_text_lengths[idx] = len(full_text)
+                
+                # Queue first chunk immediately
+                if delta_text:
+                    chunk = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": idx,
+                                "delta": {"content": delta_text},
+                                "logprobs": None,
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    await stream_queue.put_async(chunk)
+
+            # Check if this was already the final response
+            # vLLM uses finish_reason to indicate completion
+            has_finish_reason = any(result.finish_reason is not None for result in first_response.outputs)
+            
+            if has_finish_reason:
+                # Send finish chunks
+                for idx, result in enumerate(first_response.outputs):
+                    finish_reason = result.finish_reason
+                    if finish_reason is not None:
+                        chunk = {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": idx,
+                                    "delta": {},
+                                    "logprobs": None,
+                                    "finish_reason": finish_reason,
+                                }
+                            ],
+                        }
+                        await stream_queue.put_async(chunk)
+                
+                # Signal end of stream
+                await stream_queue.put_async(None)
+            else:
+                # Start background task for remaining chunks
+                asyncio.create_task(self._stream_remaining_to_queue(
+                    stream_queue, results_generator, request_id, model_name, previous_text_lengths
+                ))
+            
+            return True  # Success
+            
+        except Exception as e:
+            # Handle errors in first chunk
+            error_chunk = {"error": {"message": f"First chunk error: {str(e)}"}}
+            await stream_queue.put_async(error_chunk)
+            await stream_queue.put_async(None)
+            return False
+
+    async def _stream_remaining_to_queue(self, stream_queue, results_generator, request_id: str, model_name: str, previous_text_lengths: Dict[int, int]):
+        """
+        Stream the REMAINING chunks after the first one has been preheated.
+        This runs in the background.
+        """
+        try:
             async for response_output in results_generator:
                 # Update trace asynchronously to avoid blocking token generation
-                if self.trace_debug:
-                    asyncio.create_task(
-                        self.request_trace.update_status(request_id, response_output)
-                    )
+                await self.request_trace.update_status(request_id, response_output)
                 
                 created_ts = (
                     int(time.time())
@@ -342,8 +417,11 @@ class VllmBackend(SllmBackend):
                         }
                         await stream_queue.put_async(chunk)
 
-                # Send finish chunks when done
-                if getattr(response_output, "finished", False):
+                # Check for finish_reason to determine if stream is complete
+                has_finish_reason = any(result.finish_reason is not None for result in response_output.outputs)
+                
+                if has_finish_reason:
+                    # Send finish chunks for completed outputs
                     for idx, result in enumerate(response_output.outputs):
                         finish_reason = result.finish_reason
                         if finish_reason is not None:
@@ -362,6 +440,9 @@ class VllmBackend(SllmBackend):
                                 ],
                             }
                             await stream_queue.put_async(chunk)
+                    
+                    # Break out of the loop when we have finish_reason
+                    break
             
             # Signal end of stream
             await stream_queue.put_async(None)
@@ -373,134 +454,7 @@ class VllmBackend(SllmBackend):
             await stream_queue.put_async(None)
         finally:
             if not self.trace_debug:
-                asyncio.create_task(
-                    self.request_trace.delete_request(request_id)
-                )
-
-    async def generate_stream(self, request_data: Dict[str, Any]):
-        """
-        Generate streaming results that can be called directly by the frontend.
-        This bypasses Ray's serialization limitations.
-        """
-        # This is essentially the same as generate() but structured for direct streaming
-        async with self.status_lock:
-            if self.status != BackendStatus.RUNNING:
-                yield {"error": "Engine is not running"}
-                return
-
-        assert self.engine is not None
-
-        if request_data is None:
-            yield {"error": "Request data is missing"}
-            return
-
-        # Make a copy to avoid modifying the original
-        request_data = request_data.copy()
-        model_name: str = request_data.pop("model", "vllm-model")
-        messages: Dict[Dict[str, str], str] = request_data.pop("messages", [])
-        construct_prompt: str = "\n".join(
-            [
-                f"{message['role']}: {message['content']}"
-                for message in messages
-                if "content" in message
-            ]
-        )
-
-        # If prompt is not provided, construct it from messages
-        inputs: Union[str, TokensPrompt] = request_data.pop(
-            "prompt", construct_prompt
-        )
-        if request_data.get("input_tokens") is not None:
-            inputs = TokensPrompt(
-                prompt_token_ids=request_data.pop("input_tokens"),
-            )
-
-        request_id: str = request_data.pop(
-            "request_id", f"chatcmpl-{uuid.uuid4()}"
-        )
-
-        # Extract stream flag
-        stream: bool = request_data.pop("stream", False)
-        if not stream:
-            yield {"error": "This method is for streaming only"}
-            return
-
-        try:
-            sampling_params = SamplingParams(**request_data)
-        except Exception as e:
-            yield {"error": f"Invalid sampling parameters: {e}"}
-            return
-
-        results_generator = self.engine.generate(
-            inputs, sampling_params, request_id
-        )
-
-        previous_text_lengths: Dict[int, int] = {}
-        
-        try:
-            async for response_output in results_generator:
-                # Update trace asynchronously to avoid blocking token generation
-                if self.trace_debug:
-                    asyncio.create_task(
-                        self.request_trace.update_status(request_id, response_output)
-                    )
-                
-                created_ts = (
-                    int(time.time())
-                    if response_output.metrics is None
-                    else response_output.metrics.arrival_time
-                )
-
-                # Yield content chunks (following vLLM pattern)
-                for idx, result in enumerate(response_output.outputs):
-                    full_text = result.text or ""
-                    prev_len = previous_text_lengths.get(idx, 0)
-                    delta_text = full_text[prev_len:]
-                    previous_text_lengths[idx] = len(full_text)
-                    
-                    # Only yield if there's new content
-                    if delta_text:
-                        chunk = {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_ts,
-                            "model": model_name,
-                            "choices": [
-                                {
-                                    "index": idx,
-                                    "delta": {"content": delta_text},
-                                    "logprobs": None,
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield chunk
-
-                # Yield finish chunks when done
-                if getattr(response_output, "finished", False):
-                    for idx, result in enumerate(response_output.outputs):
-                        finish_reason = result.finish_reason
-                        if finish_reason is not None:
-                            chunk = {
-                                "id": request_id,
-                                "object": "chat.completion.chunk",
-                                "created": created_ts,
-                                "model": model_name,
-                                "choices": [
-                                    {
-                                        "index": idx,
-                                        "delta": {},
-                                        "logprobs": None,
-                                        "finish_reason": finish_reason,
-                                    }
-                                ],
-                            }
-                            yield chunk
-        finally:
-            if not self.trace_debug:
-                asyncio.create_task(
-                    self.request_trace.delete_request(request_id)
-                )
+                await self.request_trace.delete_request(request_id)
 
     async def shutdown(self):
         """Abort all requests and shutdown the backend."""
