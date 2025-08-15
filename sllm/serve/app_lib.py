@@ -16,6 +16,7 @@
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
 from contextlib import asynccontextmanager
+import asyncio
 
 import ray
 import ray.exceptions
@@ -159,19 +160,56 @@ def create_app() -> FastAPI:
             request_router = ray.get_actor(model_name, namespace="models")
 
             async def stream_results():
+                stream_info = None
                 try:
-                    # Call router once; current backend returns buffered chunks list
-                    result = await request_router.inference.remote(body, "generate")
-                    # If backend returned a list of chunks, stream them one by one
-                    if isinstance(result, dict) and result.get("object") == "chat.completion.chunk.list":
-                        for chunk in result.get("data", []):
+                    # Get streaming info from router (includes queue reference)
+                    stream_info = await request_router.inference.remote(body, "generate")
+                    
+                    if not isinstance(stream_info, dict) or not stream_info.get("streaming"):
+                        # Not a streaming response or error
+                        yield "data: " + orjson.dumps(stream_info).decode("utf-8") + "\n\n"
+                        return
+                    
+                    # Get the queue directly from the response
+                    stream_queue = stream_info["queue"]
+                    
+                    # Read from queue directly - this is the real streaming!
+                    while True:
+                        try:
+                            # Get chunk from queue with timeout
+                            chunk = await asyncio.wait_for(stream_queue.get_async(), timeout=30.0)
+                            
+                            # None signals end of stream
+                            if chunk is None:
+                                # Stream completed, trigger cleanup
+                                if stream_info.get("router_cleanup_needed") and "instance_id" in stream_info:
+                                    try:
+                                        await request_router.cleanup_streaming_request.remote(stream_info["instance_id"])
+                                    except Exception as cleanup_error:
+                                        logger.error(f"Error during router cleanup: {cleanup_error}")
+                                break
+                            
                             yield "data: " + orjson.dumps(chunk).decode("utf-8") + "\n\n"
-                    else:
-                        # Fallback: stream the single result as one event
-                        yield "data: " + orjson.dumps(result).decode("utf-8") + "\n\n"
+                            
+                        except asyncio.TimeoutError:
+                            yield "data: " + orjson.dumps({"error": {"message": "Stream timeout"}}).decode("utf-8") + "\n\n"
+                            # Also cleanup on timeout
+                            if stream_info.get("router_cleanup_needed") and "instance_id" in stream_info:
+                                try:
+                                    await request_router.cleanup_streaming_request.remote(stream_info["instance_id"])
+                                except Exception as cleanup_error:
+                                    logger.error(f"Error during router cleanup: {cleanup_error}")
+                            break
+                        
                 except Exception as e:
                     out = {"error": {"message": str(e)}}
                     yield "data: " + orjson.dumps(out).decode("utf-8") + "\n\n"
+                finally:
+                    # Clean up resources - Note: cleanup is handled by backend's _stream_to_queue finally block
+                    # and router will handle request counting when the stream completes
+                    if stream_info and "request_id" in stream_info:
+                        logger.info(f"Streaming completed for request {stream_info['request_id']}")
+                
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(stream_results(), media_type="text/event-stream; charset=utf-8")

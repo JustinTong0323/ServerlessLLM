@@ -176,20 +176,63 @@ class RoundRobinRouter(SllmRouter):
         # Looks like a known issue:
         # https://github.com/ray-project/ray/issues/26283#issuecomment-1780691475
         if action == "generate":
-            result = await instance.backend_instance.generate.remote(
-                request_data=request_data
-            )
+            # Check if streaming is requested
+            is_streaming = request_data.get("stream", False)
+            
+            if is_streaming:
+                # For streaming requests, get streaming info from backend
+                logger.info(f"Processing streaming request for model {self.model_name}")
+                stream_info = await instance.backend_instance.generate.remote(
+                    request_data=request_data
+                )
+                
+                # Check if it's a streaming response with queue
+                if isinstance(stream_info, dict) and stream_info.get("streaming"):
+                    # Return the queue reference directly for app_lib to use
+                    # We'll handle cleanup when the queue is exhausted (None received)
+                    return {
+                        "streaming": True,
+                        "queue": stream_info["queue"],
+                        "request_id": stream_info["request_id"],
+                        "instance_id": instance_id,  # For cleanup reference
+                        "router_cleanup_needed": True
+                    }
+                else:
+                    # Non-streaming response
+                    logger.warning(f"Expected streaming response but got: {type(stream_info)}")
+                    await instance.add_requests(-1)
+                    async with self.request_count_lock:
+                        self.request_count -= 1
+                    return stream_info
+            else:
+                # Non-streaming request
+                result = await instance.backend_instance.generate.remote(
+                    request_data=request_data
+                )
+                
         elif action == "encode":
             result = await instance.backend_instance.encode.remote(
                 request_data=request_data
             )
         else:
             result = {"error": "Invalid action"}
+            
         logger.info(f"Finished processing request")
         await instance.add_requests(-1)
         async with self.request_count_lock:
             self.request_count -= 1
         return result
+
+    async def cleanup_streaming_request(self, instance_id: str):
+        """Clean up resources after streaming is complete"""
+        async with self.instance_management_lock:
+            if instance_id in self.ready_instances:
+                instance = self.ready_instances[instance_id]
+                await instance.add_requests(-1)
+                logger.info(f"Cleaned up streaming request for instance {instance_id}")
+        
+        async with self.request_count_lock:
+            self.request_count -= 1
 
     async def fine_tuning(self, request_data: dict):
         async with self.running_lock:
