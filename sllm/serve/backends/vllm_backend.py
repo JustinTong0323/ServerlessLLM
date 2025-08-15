@@ -263,11 +263,18 @@ class VllmBackend(SllmBackend):
         if stream:
             previous_text_lengths: Dict[int, int] = {}
             chunks: List[Dict[str, Any]] = []
+            
+            # Track timing metrics
+            request_start_time = time.time()
+            first_token_time = None
+            token_timestamps = []
+            total_tokens_generated = 0
 
             async for response_output in results_generator:
                 await self.request_trace.update_status(request_id, response_output)
+                current_time = time.time()
                 created_ts = (
-                    int(time.time())
+                    current_time
                     if response_output.metrics is None
                     else response_output.metrics.arrival_time
                 )
@@ -277,7 +284,17 @@ class VllmBackend(SllmBackend):
                     prev_len = previous_text_lengths.get(idx, 0)
                     delta_text = full_text[prev_len:]
                     previous_text_lengths[idx] = len(full_text)
+                    
                     if delta_text:
+                        # Track first token time (TTFT)
+                        if first_token_time is None:
+                            first_token_time = current_time
+                            ttft_ms = (first_token_time - request_start_time) * 1000
+                        
+                        # Track token generation timestamps for TPOT calculation
+                        token_timestamps.append(current_time)
+                        total_tokens_generated += len(delta_text.split())  # Approximate token count
+                        
                         chunks.append(
                             {
                                 "id": request_id,
@@ -292,10 +309,29 @@ class VllmBackend(SllmBackend):
                                         "finish_reason": None,
                                     }
                                 ],
+                                # Add timing metrics to each chunk
+                                "timing": {
+                                    "ttft_ms": ttft_ms if first_token_time else None,
+                                    "timestamp": current_time,
+                                }
                             }
                         )
 
                 if getattr(response_output, "finished", False):
+                    # Calculate final metrics
+                    final_time = time.time()
+                    total_latency_ms = (final_time - request_start_time) * 1000
+                    
+                    # Calculate TPOT (Time Per Output Token)
+                    tpot_ms = None
+                    if len(token_timestamps) > 1 and total_tokens_generated > 0:
+                        # Calculate average time between tokens
+                        inter_token_latencies = [
+                            (token_timestamps[i] - token_timestamps[i-1]) * 1000 
+                            for i in range(1, len(token_timestamps))
+                        ]
+                        tpot_ms = sum(inter_token_latencies) / len(inter_token_latencies)
+                    
                     for idx, result in enumerate(response_output.outputs):
                         finish_reason = result.finish_reason
                         if finish_reason is not None:
@@ -313,6 +349,14 @@ class VllmBackend(SllmBackend):
                                             "finish_reason": finish_reason,
                                         }
                                     ],
+                                    # Add final timing metrics
+                                    "timing": {
+                                        "ttft_ms": ttft_ms if first_token_time else None,
+                                        "tpot_ms": tpot_ms,
+                                        "total_latency_ms": total_latency_ms,
+                                        "total_tokens": total_tokens_generated,
+                                        "timestamp": final_time,
+                                    }
                                 }
                             )
 
@@ -329,16 +373,48 @@ class VllmBackend(SllmBackend):
 
         # Non-stream case
         final_output = None
+        request_start_time = time.time()
+        first_token_time = None
+        
         async for response_output in results_generator:
             final_output = response_output
             await self.request_trace.update_status(request_id, response_output)
+            
+            # Track first token time for non-streaming
+            if first_token_time is None and response_output.outputs:
+                for result in response_output.outputs:
+                    if result.text:  # First non-empty output
+                        first_token_time = time.time()
+                        break
 
         assert final_output is not None
 
         if not self.trace_debug:
             await self.request_trace.delete_request(request_id)
 
-        return process_output(final_output, model_name)
+        # Calculate timing metrics for non-streaming
+        final_time = time.time()
+        total_latency_ms = (final_time - request_start_time) * 1000
+        ttft_ms = (first_token_time - request_start_time) * 1000 if first_token_time else None
+        
+        # For non-streaming, TPOT can be estimated from total time and token count
+        total_output_tokens = sum(len(result.token_ids) for result in final_output.outputs)
+        tpot_ms = None
+        if ttft_ms and total_output_tokens > 1:
+            decode_time_ms = total_latency_ms - ttft_ms
+            tpot_ms = decode_time_ms / (total_output_tokens - 1)
+
+        response = process_output(final_output, model_name)
+        
+        # Add timing metrics to the response
+        response["timing"] = {
+            "ttft_ms": ttft_ms,
+            "tpot_ms": tpot_ms,
+            "total_latency_ms": total_latency_ms,
+            "total_output_tokens": total_output_tokens,
+        }
+        
+        return response
 
     async def shutdown(self):
         """Abort all requests and shutdown the backend."""
